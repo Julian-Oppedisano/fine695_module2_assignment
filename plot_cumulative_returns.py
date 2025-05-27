@@ -15,7 +15,7 @@ def get_best_model_name():
         return f.read().strip()
 
 def load_portfolio_returns(model_name):
-    port_ret_path = os.path.join(PORT_RET_DIR, f'{model_name}_port_ret.csv')
+    port_ret_path = os.path.join(PORT_RET_DIR, f'{model_name}_overall_port_ret.csv')
     port_ret = pd.read_csv(port_ret_path, index_col=0, parse_dates=True)
     # Use the correct column name
     col = [c for c in port_ret.columns if c.startswith(model_name)][0] if any(c.startswith(model_name) for c in port_ret.columns) else port_ret.columns[0]

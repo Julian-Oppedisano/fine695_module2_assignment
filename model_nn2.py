@@ -1,101 +1,170 @@
 import pandas as pd
-from sklearn.neural_network import MLPRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
+import numpy as np
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
-import joblib
+import joblib # For saving scaler if needed, or final model if not Keras native save
 import json
 import os
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2 # For L2 regularization
+
 from utils import next_window
 from portfolio_utils import form_portfolio, calculate_performance_metrics
 
-# Load data and predictors
-df = pd.read_csv('Data/homework_sample_big.csv')
-df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d')
-df = df.sort_values(['date', 'permno'])
-predictors = pd.read_csv('Data/factors_char_list.csv')['variable'].tolist()
+# Define NN2 Model
+def create_nn2_model(input_dim, nn_units1=64, nn_units2=32, dropout_rate=0.2, l2_reg=0.01, optimizer='adam'):
+    model = Sequential([
+        Dense(nn_units1, activation='relu', input_shape=(input_dim,), kernel_regularizer=l2(l2_reg)),
+        Dropout(dropout_rate),
+        Dense(nn_units2, activation='relu', kernel_regularizer=l2(l2_reg)),
+        Dropout(dropout_rate),
+        Dense(1) # Output layer for regression
+    ])
+    model.compile(optimizer=optimizer, loss='mse')
+    return model
 
-# Get first window's train/val/test splits
-train, val, test = next_window(df).__next__()
+def run_nn2_model():
+    df = pd.read_csv('Data/homework_sample_big.csv')
+    df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d')
+    df = df.sort_values(['date', 'permno'])
+    predictors = pd.read_csv('Data/factors_char_list.csv')['variable'].tolist()
+    target = 'stock_exret'
 
-# Median imputation (as in preprocess.py)
-medians = train[predictors].median()
-train[predictors] = train[predictors].fillna(medians)
-val[predictors] = val[predictors].fillna(medians)
-test[predictors] = test[predictors].fillna(medians)
+    os.makedirs('outputs', exist_ok=True)
 
-# Pipeline and grid
-pipeline = Pipeline([
-    ('model', MLPRegressor(random_state=42, max_iter=1000))
-])
-grid = {
-    'model__hidden_layer_sizes': [(50,), (100,), (50, 50)],
-    'model__activation': ['relu', 'tanh'],
-    'model__alpha': [0.0001, 0.001, 0.01]
-}
+    all_oos_predictions = []
+    all_oos_r2 = []
 
-# GridSearchCV on train, score=r2
-search = GridSearchCV(pipeline, grid, scoring='r2', cv=3, n_jobs=-1)
-search.fit(train[predictors], train['stock_exret'])
+    # NN parameters (could be tuned with a more sophisticated hyperparameter search)
+    nn_epochs = 50 # Max epochs for NN training
+    nn_batch_size = 256
+    # Fixed hyperparameters for this example; a full GridSearchCV equivalent for Keras is more complex (e.g. KerasTuner)
+    nn_units1=64
+    nn_units2=32
+    dropout_rate=0.2
+    l2_reg_strength=0.01 
 
-# Evaluate on validation split
-y_val_pred = search.predict(val[predictors])
-best_score = r2_score(val['stock_exret'], y_val_pred)
+    print("Starting NN2 model processing with expanding window...")
 
-# Save best params and score
-os.makedirs('outputs', exist_ok=True)
-result = {'best_params': search.best_params_, 'best_score': best_score}
-with open('outputs/nn2_params.json', 'w') as f:
-    json.dump(result, f)
-print('Best params and score saved to outputs/nn2_params.json')
+    for i, (train_df, val_df, test_df) in enumerate(next_window(df)):
+        current_oos_year = test_df['date'].dt.year.iloc[0]
+        print(f"Processing OOS Year: {current_oos_year} for NN2")
 
-# Task 13: Re-fit on combined train+val using best params
-best_params = search.best_params_
-pipeline.set_params(**best_params)
-pipeline.fit(pd.concat([train, val])[predictors], pd.concat([train, val])['stock_exret'])
+        train_df = train_df.copy()
+        val_df = val_df.copy()
+        test_df = test_df.copy()
 
-# Save fitted model
-joblib.dump(pipeline, 'outputs/nn2_model.pkl')
-print('Fitted model saved to outputs/nn2_model.pkl')
+        medians = train_df[predictors].median()
+        train_df[predictors] = train_df[predictors].fillna(medians)
+        val_df[predictors] = val_df[predictors].fillna(medians)
+        test_df[predictors] = test_df[predictors].fillna(medians)
 
-# Test: reload model
-loaded_model = joblib.load('outputs/nn2_model.pkl')
-print('Model reloaded successfully')
+        scaler = StandardScaler()
+        train_df[predictors] = scaler.fit_transform(train_df[predictors])
+        val_df[predictors] = scaler.transform(val_df[predictors])
+        test_df[predictors] = scaler.transform(test_df[predictors])
+        
+        train_df[target] = train_df[target].fillna(0)
+        val_df[target] = val_df[target].fillna(0)
+        test_df[target] = test_df[target].fillna(0)
 
-# Task 14: Generate predictions for stock_exret on test window
-test = test.copy()  # Create a copy to avoid fragmentation
-test.loc[:, 'nn2_pred'] = loaded_model.predict(test[predictors])
-print('Predictions saved to test DataFrame as nn2_pred')
-print('All predictions non-null:', test['nn2_pred'].notna().all())
+        input_dim = len(predictors)
+        
+        # Create and Train NN2 Model for the current window
+        # Phase 1: Train with validation_data for early stopping to get an idea of good epochs / check convergence
+        model_val_phase = create_nn2_model(input_dim, nn_units1, nn_units2, dropout_rate, l2_reg_strength)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        
+        if train_df[predictors].shape[0] < nn_batch_size or val_df[predictors].shape[0] == 0:
+            print(f"Skipping NN training for OOS year {current_oos_year} due to insufficient train/val data.")
+            test_df.loc[:, 'nn2_pred'] = np.nan
+            model_for_prediction = None
+        else:
+            history = model_val_phase.fit(train_df[predictors], train_df[target],
+                                epochs=nn_epochs, batch_size=nn_batch_size,
+                                validation_data=(val_df[predictors], val_df[target]),
+                                callbacks=[early_stopping], verbose=0)
+            # Use the model state restored by EarlyStopping (best weights based on val_loss)
+            # Now, re-train on combined train+val data. 
+            # Option 1: Use epochs from early stopping (len(history.epoch))
+            # Option 2: Re-train for a fixed number of epochs or until loss plateaus on combined set (no val_split here)
+            final_epochs = len(history.epoch) # Use epochs determined by early stopping on validation set
 
-# Task 15: Compute out-of-sample R² score
-oos_r2 = r2_score(test['stock_exret'], test['nn2_pred'])
-print('Out-of-sample R² score:', oos_r2)
+            model_for_prediction = create_nn2_model(input_dim, nn_units1, nn_units2, dropout_rate, l2_reg_strength)
+            combined_train_val_predictors = np.vstack((train_df[predictors], val_df[predictors]))
+            combined_train_val_target = pd.concat([train_df[target], val_df[target]])
+            
+            if combined_train_val_predictors.shape[0] < nn_batch_size:
+                print(f"Skipping final NN training for OOS year {current_oos_year} due to insufficient combined data.")
+                test_df.loc[:, 'nn2_pred'] = np.nan
+                model_for_prediction = None # Ensure it's not used if not trained
+            else:
+                 model_for_prediction.fit(combined_train_val_predictors, combined_train_val_target,
+                                   epochs=final_epochs, batch_size=nn_batch_size, verbose=0)
+        
+        if model_for_prediction is not None and test_df[predictors].shape[0] > 0:
+            test_df.loc[:, 'nn2_pred'] = model_for_prediction.predict(test_df[predictors], verbose=0).flatten()
+        else:
+            test_df.loc[:, 'nn2_pred'] = np.nan # if no model trained or no test data
 
-# Append to metrics.csv
-metrics = pd.DataFrame({'model': ['nn2'], 'oos_r2': [oos_r2]})
-metrics.to_csv('outputs/metrics.csv', mode='a', header=not os.path.exists('outputs/metrics.csv'), index=False)
-print('Metrics appended to outputs/metrics.csv')
+        test_df['nn2_pred'] = test_df['nn2_pred'].fillna(0)
 
-# Task 16: Form monthly portfolio
-# Form portfolio using utility function
-nn2_port_ret = form_portfolio(test, 'nn2_pred', n_stocks=50)
-nn2_port_ret.columns = ['nn2_port_ret']  # Rename to match model name
-nn2_port_ret.to_csv('outputs/nn2_port_ret.csv')
-print('Monthly portfolio returns saved to outputs/nn2_port_ret.csv')
+        oos_r2_year = r2_score(test_df[target], test_df['nn2_pred'])
+        all_oos_r2.append(oos_r2_year)
+        print(f"Year {current_oos_year} - NN2 OOS R2: {oos_r2_year:.4f}")
 
-# Task 17: Performance stats
-# Read SPY returns
-spy_returns = pd.read_excel('Data/SPY returns.xlsx', index_col=0)
-spy_returns.index = pd.to_datetime(spy_returns.index)
+        all_oos_predictions.append(test_df[['date', 'permno', 'nn2_pred', target]])
 
-# Calculate performance metrics using utility function
-perf_summary = calculate_performance_metrics(
-    nn2_port_ret,
-    spy_returns,
-    'nn2'
-)
+        if i == len(list(next_window(df))) - 1 and model_for_prediction is not None:
+            model_for_prediction.save('outputs/nn2_model_last_window.keras')
+            print("Saved final NN2 model for last window to outputs/nn2_model_last_window.keras")
+            # Params are fixed in this example, but could save them if tuned
+            params_to_save = {'nn_units1': nn_units1, 'nn_units2': nn_units2, 'dropout': dropout_rate, 'l2': l2_reg_strength, 'oos_r2_last_window': oos_r2_year}
+            with open('outputs/nn2_params_last_window.json', 'w') as f:
+                 json.dump(params_to_save, f)
+            print("Saved params for NN2 (last window) to outputs/nn2_params_last_window.json")
 
-# Append to perf_summary.csv
-perf_summary.to_csv('outputs/perf_summary.csv', mode='a', header=not os.path.exists('outputs/perf_summary.csv'), index=False)
-print('Performance summary appended to outputs/perf_summary.csv') 
+    print("Finished processing all windows for NN2 model.")
+
+    if not all_oos_predictions:
+        print("No NN2 predictions were generated. Exiting.")
+        return
+
+    all_predictions_df = pd.concat(all_oos_predictions)
+    overall_oos_r2 = np.mean(all_oos_r2) if all_oos_r2 else np.nan
+    print(f'Overall Average OOS R² score for NN2: {overall_oos_r2:.4f}')
+
+    metrics_df = pd.DataFrame({'model': ['nn2'], 'oos_r2': [overall_oos_r2]})
+    metrics_file = 'outputs/metrics.csv'
+    if os.path.exists(metrics_file):
+        existing_metrics = pd.read_csv(metrics_file)
+        existing_metrics = existing_metrics[existing_metrics['model'] != 'nn2']
+        metrics_df = pd.concat([existing_metrics, metrics_df])
+    metrics_df.to_csv(metrics_file, index=False)
+    print(f'Overall NN2 metrics saved to {metrics_file}')
+
+    all_predictions_df = all_predictions_df.rename(columns={target: 'stock_exret'})
+    nn2_overall_port_ret = form_portfolio(all_predictions_df, 'nn2_pred', n_stocks=50)
+    nn2_overall_port_ret.columns = ['nn2_port_ret']
+    nn2_overall_port_ret.to_csv('outputs/nn2_overall_port_ret.csv')
+    print('Overall NN2 monthly portfolio returns saved to outputs/nn2_overall_port_ret.csv')
+
+    spy_returns = pd.read_excel('Data/SPY returns.xlsx', index_col=0)
+    spy_returns.index = pd.to_datetime(spy_returns.index)
+    perf_summary_df = calculate_performance_metrics(nn2_overall_port_ret, spy_returns, 'nn2')
+    summary_file = 'outputs/perf_summary.csv'
+    if os.path.exists(summary_file):
+        existing_summary = pd.read_csv(summary_file)
+        existing_summary = existing_summary[existing_summary['model'] != 'nn2']
+        perf_summary_df = pd.concat([existing_summary, perf_summary_df])
+    perf_summary_df.to_csv(summary_file, index=False)
+    print(f'Overall NN2 performance summary saved to {summary_file}')
+
+if __name__ == "__main__":
+    tf.random.set_seed(42)
+    np.random.seed(42)
+    run_nn2_model() 

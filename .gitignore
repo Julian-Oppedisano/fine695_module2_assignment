@@ -1,22 +1,56 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Virtual environment
-venv/
-.venv/
-ENV/
+# Virtual Environment
+.env
+.venv
 env/
+venv/
 ENV/
+.mlenv/
 
-# Output files
-fine695_module2_assignment/outputs/
-
-# IDE / OS specific
-.DS_Store
-.vscode/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# Data files (optional - uncomment if you don't want to commit data)
-# fine695_module2_assignment/Data/ 
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+Data/*.xlsx
+Data/*.csv
+outputs/
+slides/~.pptx
+
+# Large files
+.mlenv/lib/python3.10/site-packages/torch/lib/libtorch_cpu.dylib
+Data/homework_sample_big.csv
+.mlenv/lib/python3.10/site-packages/torch/lib/*
+.mlenv/lib/python3.10/site-packages/torch/*
+.mlenv/lib/python3.10/site-packages/*
+.mlenv/*
+
+# Other projects to ignore
+fine695_clean/

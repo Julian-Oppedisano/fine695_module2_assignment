@@ -1,99 +1,120 @@
 import pandas as pd
-from sklearn.linear_model import Ridge
+import numpy as np
+from sklearn.linear_model import RidgeCV
+from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import r2_score
 import joblib
-import json
+import json # For parameters, though RidgeCV stores alpha_
 import os
 from utils import next_window
 from portfolio_utils import form_portfolio, calculate_performance_metrics
 
-# Load data and predictors
-df = pd.read_csv('Data/homework_sample_big.csv')
-df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d')
-df = df.sort_values(['date', 'permno'])
-predictors = pd.read_csv('Data/factors_char_list.csv')['variable'].tolist()
+def run_ridge_model():
+    # Load data and predictors
+    df = pd.read_csv('Data/homework_sample_big.csv')
+    df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d')
+    df = df.sort_values(['date', 'permno'])
+    predictors = pd.read_csv('Data/factors_char_list.csv')['variable'].tolist()
+    target = 'stock_exret'
 
-# Get first window's train/val/test splits
-train, val, test = next_window(df).__next__()
+    os.makedirs('outputs', exist_ok=True)
 
-# Median imputation (as in preprocess.py)
-medians = train[predictors].median()
-train[predictors] = train[predictors].fillna(medians)
-val[predictors] = val[predictors].fillna(medians)
-test[predictors] = test[predictors].fillna(medians)
+    all_oos_predictions = []
+    all_oos_r2 = []
+    
+    ridge_alphas = [0.1, 1.0, 10.0, 50.0, 100.0, 200.0, 500.0] # Expanded alphas slightly
 
-# Pipeline and grid
-pipeline = Pipeline([
-    ('model', Ridge(max_iter=10000))
-])
-grid = {
-    'model__alpha': [0.01, 0.1, 1.0, 10.0]
-}
+    print("Starting Ridge model processing with expanding window (with scaling)...")
 
-# GridSearchCV on train, score=r2
-search = GridSearchCV(pipeline, grid, scoring='r2', cv=3, n_jobs=-1)
-search.fit(train[predictors], train['stock_exret'])
+    for i, (train_df, val_df, test_df) in enumerate(next_window(df)):
+        current_oos_year = test_df['date'].dt.year.iloc[0]
+        print(f"Processing OOS Year: {current_oos_year} for Ridge")
 
-# Evaluate on validation split
-y_val_pred = search.predict(val[predictors])
-best_score = r2_score(val['stock_exret'], y_val_pred)
+        train_df = train_df.copy()
+        val_df = val_df.copy()
+        test_df = test_df.copy()
 
-# Save best params and score
-os.makedirs('outputs', exist_ok=True)
-result = {'best_params': search.best_params_, 'best_score': best_score}
-with open('outputs/ridge_params.json', 'w') as f:
-    json.dump(result, f)
-print('Best params and score saved to outputs/ridge_params.json')
+        medians = train_df[predictors].median()
+        train_df[predictors] = train_df[predictors].fillna(medians)
+        val_df[predictors] = val_df[predictors].fillna(medians)
+        test_df[predictors] = test_df[predictors].fillna(medians)
+        
+        train_df[target] = train_df[target].fillna(0)
+        val_df[target] = val_df[target].fillna(0)
+        test_df[target] = test_df[target].fillna(0)
 
-# Task 13: Re-fit on combined train+val using best params
-best_params = search.best_params_
-pipeline.set_params(**best_params)
-pipeline.fit(pd.concat([train, val])[predictors], pd.concat([train, val])['stock_exret'])
+        # Create a pipeline with StandardScaler and RidgeCV
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', RidgeCV(alphas=ridge_alphas, store_cv_results=True)) # store_cv_results is the new name
+        ])
+        
+        # Fit the pipeline on train_df. RidgeCV will select best alpha based on internal CV on scaled data.
+        pipeline.fit(train_df[predictors], train_df[target])
+        best_alpha = pipeline.named_steps['ridge'].alpha_
 
-# Save fitted model
-joblib.dump(pipeline, 'outputs/ridge_model.pkl')
-print('Fitted model saved to outputs/ridge_model.pkl')
+        # Re-fit on combined train_df + val_df using the best alpha and same scaling
+        # The pipeline handles fitting the scaler on the new combined data and then fitting Ridge.
+        final_pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', RidgeCV(alphas=[best_alpha], store_cv_results=True)) # Effectively a Ridge model with fixed alpha
+        ])
 
-# Test: reload model
-loaded_model = joblib.load('outputs/ridge_model.pkl')
-print('Model reloaded successfully')
+        combined_train_val_df = pd.concat([train_df, val_df])
+        final_pipeline.fit(combined_train_val_df[predictors], combined_train_val_df[target])
 
-# Task 14: Generate predictions for stock_exret on test window
-test = test.copy()  # Create a copy to avoid fragmentation
-test.loc[:, 'ridge_pred'] = loaded_model.predict(test[predictors])
-print('Predictions saved to test DataFrame as ridge_pred')
-print('All predictions non-null:', test['ridge_pred'].notna().all())
+        test_df.loc[:, 'ridge_pred'] = final_pipeline.predict(test_df[predictors])
+        
+        oos_r2_year = r2_score(test_df[target], test_df['ridge_pred'])
+        all_oos_r2.append(oos_r2_year)
+        print(f"Year {current_oos_year} - Ridge OOS R2: {oos_r2_year:.4f}, Best Alpha: {best_alpha}")
 
-# Task 15: Compute out-of-sample R² score
-oos_r2 = r2_score(test['stock_exret'], test['ridge_pred'])
-print('Out-of-sample R² score:', oos_r2)
+        all_oos_predictions.append(test_df[['date', 'permno', 'ridge_pred', target]])
 
-# Append to metrics.csv
-metrics = pd.DataFrame({'model': ['ridge'], 'oos_r2': [oos_r2]})
-metrics.to_csv('outputs/metrics.csv', mode='a', header=not os.path.exists('outputs/metrics.csv'), index=False)
-print('Metrics appended to outputs/metrics.csv')
+        if i == len(list(next_window(df))) - 1: 
+            joblib.dump(final_pipeline, 'outputs/ridge_model_last_window.pkl')
+            print(f"Saved final Ridge pipeline (alpha={best_alpha}) for last window to outputs/ridge_model_last_window.pkl")
+            params_to_save = {'best_alpha_last_window': best_alpha, 'oos_r2_last_window': oos_r2_year}
+            with open('outputs/ridge_params_last_window.json', 'w') as f:
+                json.dump(params_to_save, f)
+            print("Saved params for Ridge (last window) to outputs/ridge_params_last_window.json")
+            
+    print("Finished processing all windows for Ridge model.")
 
-# Task 16: Form monthly portfolio
-# Form portfolio using utility function
-ridge_port_ret = form_portfolio(test, 'ridge_pred', n_stocks=50)
-ridge_port_ret.columns = ['ridge_port_ret']  # Rename to match model name
-ridge_port_ret.to_csv('outputs/ridge_port_ret.csv')
-print('Monthly portfolio returns saved to outputs/ridge_port_ret.csv')
+    if not all_oos_predictions:
+        print("No Ridge predictions were generated. Exiting.")
+        return
 
-# Task 17: Performance stats
-# Read SPY returns
-spy_returns = pd.read_excel('Data/SPY returns.xlsx', index_col=0)
-spy_returns.index = pd.to_datetime(spy_returns.index)
+    all_predictions_df = pd.concat(all_oos_predictions)
+    overall_oos_r2 = np.mean(all_oos_r2) if all_oos_r2 else np.nan
+    print(f'Overall Average OOS R² score for Ridge: {overall_oos_r2:.4f}')
 
-# Calculate performance metrics using utility function
-perf_summary = calculate_performance_metrics(
-    ridge_port_ret,
-    spy_returns,
-    'ridge'
-)
+    metrics_df = pd.DataFrame({'model': ['ridge'], 'oos_r2': [overall_oos_r2]})
+    metrics_file = 'outputs/metrics.csv'
+    if os.path.exists(metrics_file):
+        existing_metrics = pd.read_csv(metrics_file)
+        existing_metrics = existing_metrics[existing_metrics['model'] != 'ridge']
+        metrics_df = pd.concat([existing_metrics, metrics_df])
+    metrics_df.to_csv(metrics_file, index=False)
+    print(f'Overall Ridge metrics saved to {metrics_file}')
 
-# Append to perf_summary.csv
-perf_summary.to_csv('outputs/perf_summary.csv', mode='a', header=not os.path.exists('outputs/perf_summary.csv'), index=False)
-print('Performance summary appended to outputs/perf_summary.csv') 
+    all_predictions_df = all_predictions_df.rename(columns={target: 'stock_exret'})
+    ridge_overall_port_ret = form_portfolio(all_predictions_df, 'ridge_pred', n_stocks=50)
+    ridge_overall_port_ret.columns = ['ridge_port_ret'] 
+    ridge_overall_port_ret.to_csv('outputs/ridge_overall_port_ret.csv')
+    print('Overall Ridge monthly portfolio returns saved to outputs/ridge_overall_port_ret.csv')
+
+    spy_returns = pd.read_excel('Data/SPY returns.xlsx', index_col=0)
+    spy_returns.index = pd.to_datetime(spy_returns.index)
+    perf_summary_df = calculate_performance_metrics(ridge_overall_port_ret, spy_returns, 'ridge')
+    summary_file = 'outputs/perf_summary.csv'
+    if os.path.exists(summary_file):
+        existing_summary = pd.read_csv(summary_file)
+        existing_summary = existing_summary[existing_summary['model'] != 'ridge']
+        perf_summary_df = pd.concat([existing_summary, perf_summary_df])
+    perf_summary_df.to_csv(summary_file, index=False)
+    print(f'Overall Ridge performance summary saved to {summary_file}')
+
+if __name__ == "__main__":
+    run_ridge_model() 

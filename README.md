@@ -18,6 +18,8 @@ fine695_module2_assignment/
 ├── slides/                    # Presentation slides
 │   └── Module2_template.pptx  # 5-slide presentation
 ├── model_*.py                # Model implementation scripts
+├── model_ipca.py             # New IPCA model script
+├── model_autoencoder.py      # New Autoencoder model script
 ├── utils.py                  # Utility functions
 ├── create_slide_deck.py      # Slide generation script
 ├── select_best_model.py      # Model selection script
@@ -32,6 +34,9 @@ fine695_module2_assignment/
   - Elastic Net
   - Decision Trees
   - Neural Networks (NN2)
+- New models for Module 3:
+  - Instrumented Principal Component Analysis (IPCA)
+  - Autoencoder
 - Time window approach:
   - 10-year initial training (2005-2014)
   - 2-year validation (2015-2016)
@@ -89,6 +94,8 @@ python model_ridge.py
 python model_elasticnet.py
 python model_tree.py
 python model_nn2.py
+python model_ipca.py
+python model_autoencoder.py
 ```
 
 6. Generate the presentation:
