@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+env/
+ENV/
+
+# Output files
+fine695_module2_assignment/outputs/
+
+# IDE / OS specific
+.DS_Store
+.vscode/
+.idea/
+
+# Data files (optional - uncomment if you don't want to commit data)
+# fine695_module2_assignment/Data/ 
