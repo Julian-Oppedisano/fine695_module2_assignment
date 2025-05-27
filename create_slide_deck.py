@@ -24,68 +24,73 @@ def get_best_model_name():
         print(f"Error: {BEST_ALG_PATH} not found. Run select_best_model.py first.")
         return None
 
-def load_model_metrics(best_model_name):
+def load_model_data(model_name, metrics_path, summary_path):
+    data = {'name': model_name, 'oos_r2': np.nan, 'perf_summary': pd.Series(dtype='float64')}
     try:
-        metrics_df = pd.read_csv(METRICS_PATH)
-        model_r2 = metrics_df[metrics_df['model'] == best_model_name]['oos_r2'].iloc[0]
-        return model_r2
+        metrics_df = pd.read_csv(metrics_path)
+        model_r2_series = metrics_df[metrics_df['model'] == model_name]['oos_r2']
+        if not model_r2_series.empty:
+            data['oos_r2'] = model_r2_series.iloc[0]
     except (FileNotFoundError, IndexError, KeyError) as e:
-        print(f"Error loading R2 for {best_model_name} from {METRICS_PATH}: {e}")
-        return np.nan
+        print(f"Error loading R2 for {model_name} from {metrics_path}: {e}")
 
-def load_performance_summary(best_model_name):
     try:
-        summary_df = pd.read_csv(PERF_SUMMARY_PATH)
-        model_perf = summary_df[summary_df['model'] == best_model_name].iloc[0].copy() # Use .copy() to avoid SettingWithCopyWarning
-        # These will be calculated from the model's actual returns later and added
-        if 'avg_return' not in model_perf:
-            model_perf['avg_return'] = np.nan 
-        if 'volatility' not in model_perf: 
-            model_perf['volatility'] = np.nan
-        return model_perf
+        summary_df = pd.read_csv(summary_path)
+        model_perf_series = summary_df[summary_df['model'] == model_name]
+        if not model_perf_series.empty:
+            data['perf_summary'] = model_perf_series.iloc[0].copy()
+            # Ensure avg_return and volatility are present, will be filled later if needed
+            if 'avg_return' not in data['perf_summary']:
+                 data['perf_summary']['avg_return'] = np.nan
+            if 'volatility' not in data['perf_summary']:
+                 data['perf_summary']['volatility'] = np.nan
+            
+            # Calculate Ann. Alpha if monthly alpha exists
+            if pd.notna(data['perf_summary'].get('alpha')):
+                data['perf_summary']['alpha_ann'] = data['perf_summary'].get('alpha') * 12
+            else:
+                data['perf_summary']['alpha_ann'] = np.nan
+
     except (FileNotFoundError, IndexError, KeyError) as e:
-        print(f"Error loading performance summary for {best_model_name} from {PERF_SUMMARY_PATH}: {e}")
-        return pd.Series(dtype='object') # Return empty series on error to allow .get later
+        print(f"Error loading performance summary for {model_name} from {summary_path}: {e}")
+    return data
 
-def get_spy_performance_for_period(model_returns_df):
+
+def get_spy_performance_for_period(model_returns_df, spy_data_path=SPY_DATA_PATH):
     try:
-        spy_returns_raw = pd.read_excel(SPY_DATA_PATH, index_col=0)
+        spy_returns_raw = pd.read_excel(spy_data_path, index_col=0)
         spy_returns_raw.index = pd.to_datetime(spy_returns_raw.index)
         spy_returns_raw.columns = ['spy_ret'] 
 
-        if model_returns_df is None or model_returns_df.empty:
-            print("Model returns are empty, cannot align SPY data. Calculating SPY metrics over its entire history.")
-            spy_overall_perf = calculate_performance_metrics(spy_returns_raw, spy_returns_raw, 'SPY_overall')
-            return pd.Series({
-                'alpha': '—', 
-                'sharpe': f"{spy_overall_perf.get('sharpe', np.nan).iloc[0]:.2f}" if pd.notna(spy_overall_perf.get('sharpe', np.nan).iloc[0]) else 'N/A',
-                'avg_return': f"{spy_returns_raw['spy_ret'].mean():.4f}",
-                'volatility': f"{spy_returns_raw['spy_ret'].std():.4f}",
-                'max_drawdown': f"{spy_overall_perf.get('max_drawdown', np.nan).iloc[0]:.4f}" if pd.notna(spy_overall_perf.get('max_drawdown', np.nan).iloc[0]) else 'N/A',
-                'max_loss': f"{spy_overall_perf.get('max_loss', np.nan).iloc[0]:.4f}" if pd.notna(spy_overall_perf.get('max_loss', np.nan).iloc[0]) else 'N/A'
-            })
-
-        model_start_date = model_returns_df.index.min()
-        model_end_date = model_returns_df.index.max()
-        spy_aligned = spy_returns_raw[(spy_returns_raw.index >= model_start_date) & (spy_returns_raw.index <= model_end_date)]
+        # Determine alignment period: if model_returns_df is provided, use its period
+        # Otherwise, use the full SPY period for SPY's own metrics.
+        if model_returns_df is not None and not model_returns_df.empty:
+            model_start_date = model_returns_df.index.min()
+            model_end_date = model_returns_df.index.max()
+            spy_aligned = spy_returns_raw[(spy_returns_raw.index >= model_start_date) & (spy_returns_raw.index <= model_end_date)]
+            if spy_aligned.empty:
+                print("SPY returns have no overlap with model OOS period. Using full SPY history for SPY metrics.")
+                spy_aligned = spy_returns_raw # Fallback to full history if no overlap
+        else:
+            print("No model returns for alignment. Calculating SPY metrics over its entire history.")
+            spy_aligned = spy_returns_raw
         
-        if spy_aligned.empty:
-            print("SPY returns have no overlap with model OOS period.")
-            return pd.Series(dtype='object')
+        spy_perf_metrics_calc = calculate_performance_metrics(spy_aligned, spy_aligned, 'SPY')
         
-        spy_perf_metrics = calculate_performance_metrics(spy_aligned, spy_aligned, 'SPY') 
+        spy_metrics_output = pd.Series(dtype='object')
+        spy_metrics_output['name'] = "SPY"
+        spy_metrics_output['alpha'] = 0.0 # Alpha of SPY vs SPY is 0
+        spy_metrics_output['alpha_ann'] = 0.0
+        spy_metrics_output['sharpe'] = spy_perf_metrics_calc.get('sharpe', np.nan).iloc[0] if pd.notna(spy_perf_metrics_calc.get('sharpe', np.nan).iloc[0]) else np.nan
+        spy_metrics_output['avg_return'] = spy_aligned['spy_ret'].mean()
+        spy_metrics_output['volatility'] = spy_aligned['spy_ret'].std()
+        spy_metrics_output['max_drawdown'] = spy_perf_metrics_calc.get('max_drawdown', np.nan).iloc[0] if pd.notna(spy_perf_metrics_calc.get('max_drawdown', np.nan).iloc[0]) else np.nan
+        spy_metrics_output['max_loss'] = spy_perf_metrics_calc.get('max_loss', np.nan).iloc[0] if pd.notna(spy_perf_metrics_calc.get('max_loss', np.nan).iloc[0]) else np.nan
+        return spy_metrics_output
 
-        return pd.Series({
-            'alpha': '—', 
-            'sharpe': f"{spy_perf_metrics.get('sharpe', np.nan).iloc[0]:.2f}" if pd.notna(spy_perf_metrics.get('sharpe', np.nan).iloc[0]) else 'N/A',
-            'avg_return': f"{spy_aligned['spy_ret'].mean():.4f}",
-            'volatility': f"{spy_aligned['spy_ret'].std():.4f}",
-            'max_drawdown': f"{spy_perf_metrics.get('max_drawdown', np.nan).iloc[0]:.4f}" if pd.notna(spy_perf_metrics.get('max_drawdown', np.nan).iloc[0]) else 'N/A',
-            'max_loss': f"{spy_perf_metrics.get('max_loss', np.nan).iloc[0]:.4f}" if pd.notna(spy_perf_metrics.get('max_loss', np.nan).iloc[0]) else 'N/A'
-        })
     except Exception as e:
         print(f"Error calculating SPY performance: {e}")
-        return pd.Series(dtype='object')
+        return pd.Series({'name': "SPY", 'alpha':0.0, 'alpha_ann':0.0, 'sharpe':np.nan, 'avg_return':np.nan, 'volatility':np.nan, 'max_drawdown':np.nan, 'max_loss':np.nan}, dtype='object')
 
 def update_presentation():
     best_model_name = get_best_model_name()
@@ -93,188 +98,205 @@ def update_presentation():
         print("Best model name not found. Exiting presentation update.")
         return
 
-    oos_r2 = load_model_metrics(best_model_name)
-    model_perf_summary = load_performance_summary(best_model_name)
+    # Load data for best model, IPCA, and Autoencoder
+    best_model_data = load_model_data(best_model_name, METRICS_PATH, PERF_SUMMARY_PATH)
+    ipca_data = load_model_data('ipca', METRICS_PATH, PERF_SUMMARY_PATH)
+    autoencoder_data = load_model_data('autoencoder', METRICS_PATH, PERF_SUMMARY_PATH)
 
-    model_port_ret_path = os.path.join(OUTPUT_DIR, f'{best_model_name}_overall_port_ret.csv')
-    model_returns_df = None
-    avg_model_monthly_return = np.nan
-    std_model_monthly_vol = np.nan
+    # Fill avg_return and volatility for each loaded model from their specific port_ret files
+    models_to_fill = {best_model_name: best_model_data, 'ipca': ipca_data, 'autoencoder': autoencoder_data}
+    for name, data in models_to_fill.items():
+        try:
+            port_ret_path = os.path.join(OUTPUT_DIR, f'{name}_overall_port_ret.csv')
+            returns_df = pd.read_csv(port_ret_path, index_col=0, parse_dates=True)
+            returns_col = returns_df.columns[0]
+            data['perf_summary']['avg_return'] = returns_df[returns_col].mean()
+            data['perf_summary']['volatility'] = returns_df[returns_col].std()
+        except FileNotFoundError:
+            print(f"Portfolio returns file not found for {name}: {port_ret_path}. Avg_return/volatility will be NaN.")
+            # Ensure keys exist even if file not found, if perf_summary itself is valid
+            if isinstance(data.get('perf_summary'), pd.Series):
+                 if 'avg_return' not in data['perf_summary']:
+                      data['perf_summary']['avg_return'] = np.nan
+                 if 'volatility' not in data['perf_summary']:
+                      data['perf_summary']['volatility'] = np.nan
+        except Exception as e:
+            print(f"Error processing portfolio returns for {name}: {e}")
 
+    best_model_returns_df = None
     try:
-        model_returns_df = pd.read_csv(model_port_ret_path, index_col=0, parse_dates=True)
-        model_returns_col = model_returns_df.columns[0]
-        avg_model_monthly_return = model_returns_df[model_returns_col].mean()
-        std_model_monthly_vol = model_returns_df[model_returns_col].std()
-        if model_perf_summary is not None and not model_perf_summary.empty: # Check if Series is not empty
-            model_perf_summary['avg_return'] = avg_model_monthly_return
-            model_perf_summary['volatility'] = std_model_monthly_vol
+        best_model_port_ret_path = os.path.join(OUTPUT_DIR, f'{best_model_name}_overall_port_ret.csv')
+        best_model_returns_df = pd.read_csv(best_model_port_ret_path, index_col=0, parse_dates=True)
     except FileNotFoundError:
-        print(f"Model returns file not found: {model_port_ret_path}")
-        # model_perf_summary might be None or empty here, .get will handle it.
+        print(f"Best model ({best_model_name}) returns file not found: {best_model_port_ret_path}")
         
-    spy_perf_for_table = get_spy_performance_for_period(model_returns_df)
+    spy_perf_data = get_spy_performance_for_period(best_model_returns_df) # Align SPY to best model's period
 
-    METHODOLOGY_TEXT = (
-        f"• Evaluated Models: Lasso, Ridge, ElasticNet, Decision Tree, Neural Network (NN2), IPCA, and Autoencoder.\\n"
-        f"• Best Performing Model: {best_model_name.upper()} selected for predicting next-month stock excess returns.\\n"
-        f"• Training Window: Expanding, initial 10 years (2005-2014).\\n"
-        f"• Validation Window: Expanding, initial 2 years (2015-2016) for hyperparameter tuning/model selection per window.\\n"
-        f"• Out-of-Sample (OOS) Testing: Expanding window (2017-2023), yearly model re-estimation/re-training.\\n"
-        f"• Portfolio Construction: Equal-weighted top 50 stocks (based on predictions), rebalanced monthly.\\n"
-        f"• Features: 145 lagged stock characteristics (time t) predicting returns (time t+1).\\n"
-        f"• Benchmark: S&P 500 (SPY)."
+    # Slide 1: Methodology
+    methodology_text = (
+        f"• Models Evaluated: IPCA, Autoencoder, Neural Network (NN2), and other baseline models (Lasso, Ridge, ElasticNet, Decision Tree).\n"
+        f"• Best Performing Strategy: {best_model_name.upper()} selected based on overall portfolio metrics (e.g., Sharpe Ratio).\n"
+        f"• Core Approach: Expanding window for training (initial 10yr), validation (initial 2yr), and OOS testing (2017-2023), with yearly model updates.\n"
+        f"• Portfolio: Equal-weighted top 50 stocks (from predictions), monthly rebalancing.\n"
+        f"• Features: 145 lagged stock characteristics to predict next-month excess returns.\n"
+        f"• Benchmark: S&P 500 (SPY). Environment: Frictionless trading assumed as per assignment scope."
     )
     
-    oos_r2_title_text = f"Out-of-Sample $R^2$ ({best_model_name.upper()}): {oos_r2:.4f}"
-    
-    oos_r2_interpretation_text = "Interpretation:\\n• R² measures the proportion of return variance explained by the model.\\n"
-    if pd.notna(oos_r2):
-        if oos_r2 < 0:
-            oos_r2_interpretation_text += (
-                f"• Overall Negative R² ({oos_r2:.4f}): Indicates the model, on average, underperformed a simple mean prediction across the OOS period.\\n"
-                f"• Influencing Factors: Performance was significantly impacted by specific OOS years (e.g., 2017 for {best_model_name.upper()}), highlighting challenges in consistent prediction."
-            )
-        else:
-            oos_r2_interpretation_text += (
-                f"• R² of {oos_r2:.4f}: Suggests the model explains {oos_r2*100:.2f}% of the variance in returns. A positive R² is preferred."
-            )
-    else:
-        oos_r2_interpretation_text += "• R² value not available."
+    # Slide 2: Out-of-Sample R²
+    r2_text_lines = [f"Out-of-Sample R² (Average over 2017-2023 OOS Period):\n"]
+    r2_text_lines.append(f"• {best_model_data['name'].upper()}: {best_model_data['oos_r2']:.4f}")
+    r2_text_lines.append(f"• IPCA: {ipca_data['oos_r2']:.4f}")
+    r2_text_lines.append(f"• Autoencoder: {autoencoder_data['oos_r2']:.4f}")
+    r2_text_lines.append("\nInterpretation & Diagnostics:")
+    r2_text_lines.append(f"• The {best_model_name.upper()} model shows an average OOS R² of {best_model_data['oos_r2']:.4f}. "
+                         "Negative R² values indicate underperformance against a simple mean forecast.")
+    if best_model_name == 'nn2' and pd.notna(best_model_data['oos_r2']) and best_model_data['oos_r2'] < -10: # Specific diagnostic for NN2 if R2 is very poor
+         r2_text_lines.append("• For NN2, this average was heavily impacted by extremely poor predictive performance in specific years (e.g., 2017), "
+                              "masking more moderate performance in other periods. This suggests instability in the NN2 model's predictions.")
+    r2_text_lines.append("• This highlights the challenge of achieving consistently positive R² in stock return prediction.")
+    oos_r2_full_text = '\n'.join(r2_text_lines)
 
-    summary_text = "Summary data not available."
-    if model_perf_summary is not None and not model_perf_summary.empty and pd.notna(oos_r2):
+    # Slide 5: Summary
+    summary_text = "Performance summary for the best model is incomplete."
+    if isinstance(best_model_data.get('perf_summary'), pd.Series) and not best_model_data['perf_summary'].empty:
+        avg_ret_val = best_model_data['perf_summary'].get('avg_return', np.nan)
+        sharpe_val = best_model_data['perf_summary'].get('sharpe', np.nan)
+        oos_r2_val = best_model_data['oos_r2']
         summary_text = (
-            f"The {best_model_name.upper()} strategy, despite a challenging overall OOS R² of {oos_r2:.4f} (impacted by specific years), demonstrated notable portfolio performance:\\n"
-            f"  • Monthly Alpha: {model_perf_summary.get('alpha', np.nan):.4f}\\n"
-            f"  • Annualized Sharpe Ratio: {model_perf_summary.get('sharpe', np.nan):.2f}\\n"
-            f"  • Avg. Monthly Return: {model_perf_summary.get('avg_return', np.nan)*100:.2f}%\\n"
-            f"  • Monthly Volatility: {model_perf_summary.get('volatility', np.nan)*100:.2f}%\\n"
-            f"  • Max Drawdown: {model_perf_summary.get('max_drawdown', np.nan):.2%}\\n"
-            f"Potential Improvements:\\n"
-            f"• Enhance predictive stability (e.g., robust hyperparameter tuning for {best_model_name.upper()}, address outlier year performance).\\n"
-            f"• Explore advanced feature engineering and selection techniques.\\n"
-            f"• Investigate alternative portfolio construction or risk management methodologies."
+            f"The {best_model_name.upper()} strategy, despite a challenging average OOS R² of {oos_r2_val:.2f}, "
+            f"yielded an annualized Sharpe ratio of {sharpe_val:.2f} and average monthly returns of {avg_ret_val*100:.2f}%. "
+            f"Improvements should target predictive model stability and explore alternative risk/portfolio construction techniques."
         )
+        if len(summary_text) > 250: # Heuristic to keep it punchy
+            summary_text = (
+                f"The {best_model_name.upper()} strategy (Sharpe: {sharpe_val:.2f}, Avg Rtn: {avg_ret_val*100:.2f}%) showed portfolio value despite predictive R² challenges ({oos_r2_val:.2f}). "
+                f"Focus future work on model stability & portfolio optimization."
+            )
+
 
     prs = Presentation(TEMPLATE_PATH)
     
     # Slide 1: Methodology
     slide = prs.slides[0]
+    title_shape = slide.shapes.title
+    if title_shape: title_shape.text = "Methodology Overview"
     if len(slide.placeholders) > 1:
-        tf = slide.placeholders[1].text_frame
-        tf.clear()
-        p = tf.add_paragraph()
-        p.text = METHODOLOGY_TEXT.replace("\\n", "\n") # Ensure newlines are rendered
-        p.font.size = Pt(16) 
+        tf = slide.placeholders[1].text_frame; tf.clear()
+        p = tf.add_paragraph(); p.text = methodology_text.replace("\\n", "\n"); p.font.size = Pt(16)
     
-    # Slide 2: OOS R2
+    # Slide 2: OOS R² of Key Models
     slide = prs.slides[1]
-    tf = slide.shapes.placeholders[1].text_frame
-    tf.clear()
-    p = tf.add_paragraph()
-    p.text = oos_r2_title_text
-    p.font.size = Pt(30) # Adjusted size
-    p.font.bold = True
-    p.alignment = PP_ALIGN.CENTER
-    
-    tf.add_paragraph().text = "" # Add a blank line for spacing
-    
-    p = tf.add_paragraph()
-    p.text = oos_r2_interpretation_text.replace("\\n", "\n")
-    p.font.size = Pt(18)
-    
+    title_shape = slide.shapes.title
+    if title_shape: title_shape.text = "Out-of-Sample R² Analysis (Key Models)"
+    if len(slide.placeholders) > 1:
+        tf = slide.placeholders[1].text_frame; tf.clear()
+        # Use multiple paragraphs for better spacing control
+        content_parts = oos_r2_full_text.split('\n')
+        for part in content_parts:
+            p = tf.add_paragraph()
+            p.text = part
+            p.font.size = Pt(16)
+            if part.startswith("Out-of-Sample R²") : p.font.bold = True; p.font.size = Pt(18)
+            if part.startswith("•") : p.level = 1; p.font.size = Pt(15)
+
     # Slide 3: Performance Table
     slide = prs.slides[2]
-    for shape in slide.shapes:
-        if shape.has_table:
-            sp = shape
-            slide.shapes._spTree.remove(sp._element)
+    title_shape = slide.shapes.title
+    if title_shape: title_shape.text = "Portfolio Performance Statistics (OOS 2017-2023)"
+    for shape in slide.shapes: # Clear old table
+        if shape.has_table: slide.shapes._spTree.remove(shape._element)
             
-    left = Inches(0.5); top = Inches(1.5); width = Inches(9.0); height = Inches(0.5) # Initial height, will adjust
+    table_models = [best_model_data, ipca_data, autoencoder_data, spy_perf_data]
+    header = ["Metric", best_model_name.upper(), "IPCA", "Autoencoder", "SPY", f"{best_model_name.upper()} vs SPY Δ"]
     
-    # Check if model_perf_summary and spy_perf_for_table are valid Series and have data
-    model_data_valid = isinstance(model_perf_summary, pd.Series) and not model_perf_summary.empty
-    spy_data_valid = isinstance(spy_perf_for_table, pd.Series) and not spy_perf_for_table.empty
+    rows_data = []
+    metrics_to_display = [
+        ("Alpha (monthly)", 'alpha', '.4f', False),
+        ("Alpha (annualized)", 'alpha_ann', '.4f', False),
+        ("Sharpe Ratio (ann.)", 'sharpe', '.2f', False),
+        ("Avg Return (monthly)", 'avg_return', '.2%', True), # True for percentage
+        ("Volatility (monthly)", 'volatility', '.2%', True),
+        ("Max Drawdown", 'max_drawdown', '.2%', True),
+        ("Max 1-mo Loss", 'max_loss', '.2%', True)
+    ]
 
-    if model_data_valid and spy_data_valid:
-        perf_data = [
-            ["Metric", f"{best_model_name.upper()} Strategy", "SPY"],
-            ["Alpha (monthly)", f"{model_perf_summary.get('alpha', np.nan):.4f}", spy_perf_for_table.get('alpha', 'N/A')],
-            ["Sharpe Ratio (ann.)", f"{model_perf_summary.get('sharpe', np.nan):.2f}", spy_perf_for_table.get('sharpe', 'N/A')],
-            ["Avg Return (monthly)", f"{model_perf_summary.get('avg_return', np.nan)*100:.2f}%", f"{float(spy_perf_for_table.get('avg_return', np.nan))*100:.2f}%" if pd.notna(spy_perf_for_table.get('avg_return', np.nan)) else 'N/A'],
-            ["Volatility (monthly)", f"{model_perf_summary.get('volatility', np.nan)*100:.2f}%", f"{float(spy_perf_for_table.get('volatility', np.nan))*100:.2f}%" if pd.notna(spy_perf_for_table.get('volatility', np.nan)) else 'N/A'],
-            ["Max Drawdown", f"{model_perf_summary.get('max_drawdown', np.nan):.2%}", f"{float(spy_perf_for_table.get('max_drawdown', np.nan)):.2%}" if pd.notna(spy_perf_for_table.get('max_drawdown', np.nan)) else 'N/A'],
-            ["Max 1-mo Loss", f"{model_perf_summary.get('max_loss', np.nan):.2%}", f"{float(spy_perf_for_table.get('max_loss', np.nan)):.2%}" if pd.notna(spy_perf_for_table.get('max_loss', np.nan)) else 'N/A']
-        ]
-        rows, cols = len(perf_data), len(perf_data[0])
-        table_shape = slide.shapes.add_table(rows, cols, left, top, width, Inches(rows * 0.45)) # Adjusted height per row
+    for display_name, key, fmt, is_percent in metrics_to_display:
+        row = [display_name]
+        best_model_val = np.nan
+        spy_val_for_delta = np.nan
+
+        for i, model_data_item in enumerate(table_models):
+            val = model_data_item.get('perf_summary', pd.Series(dtype='float64')).get(key, np.nan) if i < 3 else model_data_item.get(key, np.nan)
+            if is_percent and pd.notna(val): formatted_val = f"{val:{fmt}}" 
+            elif pd.notna(val): formatted_val = f"{val:{fmt}}"
+            else: formatted_val = "N/A"
+            row.append(formatted_val)
+            if i == 0: best_model_val = val # Best model's value
+            if model_data_item.get('name') == "SPY": spy_val_for_delta = val
+        
+        # Calculate Delta (Best Model - SPY)
+        if pd.notna(best_model_val) and pd.notna(spy_val_for_delta) and key not in ['alpha', 'alpha_ann']: # Alpha for SPY is 0, so delta is just best_model_val
+            delta = best_model_val - spy_val_for_delta
+            if is_percent: row.append(f"{delta:{fmt}}")
+            else: row.append(f"{delta:{fmt}}")
+        elif key in ['alpha', 'alpha_ann'] and pd.notna(best_model_val):
+             delta = best_model_val # Since SPY alpha is 0
+             row.append(f"{delta:{fmt}}")
+        else:
+            row.append("N/A")
+        rows_data.append(row)
+
+    if rows_data:
+        num_rows = len(rows_data) + 1 # +1 for header
+        num_cols = len(header)
+        left, top, width = Inches(0.2), Inches(1.2), Inches(9.6)
+        table_shape = slide.shapes.add_table(num_rows, num_cols, left, top, width, Inches(num_rows * 0.35))
         table = table_shape.table
-        for r, row_data in enumerate(perf_data):
-            for c, cell_data in enumerate(row_data):
-                cell = table.cell(r,c)
-                cell.text = str(cell_data)
-                tc = cell.text_frame
-                p = tc.paragraphs[0]
-                p.font.size = Pt(14)
-                p.alignment = PP_ALIGN.CENTER
-                if r == 0: p.font.bold = True
-                # Adjust column widths (example: make first column wider)
-                if c == 0 : table.columns[c].width = Inches(2.5)
-                else: table.columns[c].width = Inches(2.1)
 
+        for c, header_text in enumerate(header):
+            table.cell(0,c).text = header_text
+            p = table.cell(0,c).text_frame.paragraphs[0]; p.font.bold = True; p.font.size = Pt(10); p.alignment = PP_ALIGN.CENTER
 
+        for r_idx, data_row in enumerate(rows_data):
+            for c_idx, cell_val in enumerate(data_row):
+                table.cell(r_idx+1, c_idx).text = str(cell_val)
+                p = table.cell(r_idx+1, c_idx).text_frame.paragraphs[0]; p.font.size = Pt(10); p.alignment = PP_ALIGN.CENTER
+        
+        # Adjust column widths (example)
+        widths = [Inches(1.8), Inches(1.3), Inches(1.3), Inches(1.3), Inches(1.3), Inches(1.6)]
+        for i, col_width in enumerate(widths):
+            if i < num_cols: table.columns[i].width = col_width
     else:
-        tf = slide.shapes.placeholders[1].text_frame; tf.clear(); 
-        p = tf.add_paragraph()
-        p.text = "Performance data for model or SPY is not available."
-        p.alignment = PP_ALIGN.CENTER
-        p.font.size = Pt(18)
+        tf = slide.shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(1)).text_frame
+        p = tf.add_paragraph(); p.text = "Performance table data not available."; p.alignment = PP_ALIGN.CENTER
 
     # Slide 4: Cumulative Returns Plot
     slide = prs.slides[3]
-    # Clear existing title placeholder text if it's the default one
     title_shape = slide.shapes.title
-    if title_shape and title_shape.has_text_frame and title_shape.text_frame.text.startswith("Click to add title"):
-         title_shape.text_frame.clear() # Clear default text only
-         title_shape.text = f"Cumulative OOS Returns: {best_model_name.upper()} vs SPY"
-
+    if title_shape: 
+        title_shape.text = f"Cumulative OOS Returns: {best_model_name.upper()} vs SPY (2017-2023)"
 
     if os.path.exists(CUM_RET_PNG):
-        pic_left = Inches(0.5)
-        pic_top = Inches(1.2) # Adjusted top to give space for title
-        pic_width = Inches(9.0) 
-        # Optional: Maintain aspect ratio
-        # from pptx.util import Emu
-        # img = Image.open(CUM_RET_PNG)
-        # aspect_ratio = img.height / img.width
-        # pic_height = Emu(pic_width * aspect_ratio)
-
-        # Clear existing pictures first
-        for shape_idx in reversed(range(len(slide.shapes))): # Iterate backwards for safe removal
+        pic_left, pic_top, pic_width = Inches(0.5), Inches(1.2), Inches(9.0)
+        for shape_idx in reversed(range(len(slide.shapes))):
             shape = slide.shapes[shape_idx]
-            if shape.shape_type == 13: # msoPicture
-                 sp = shape._element
-                 slide.shapes._spTree.remove(sp)
-        slide.shapes.add_picture(CUM_RET_PNG, pic_left, pic_top, width=pic_width) # height can be specified too
+            if shape.shape_type == 13: slide.shapes._spTree.remove(shape._element)
+        slide.shapes.add_picture(CUM_RET_PNG, pic_left, pic_top, width=pic_width)
     else:
-        tf = slide.placeholders[1].text_frame if len(slide.placeholders) > 1 else slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(1)).text_frame
-        tf.clear(); 
-        p = tf.add_paragraph()
-        p.text = "Cumulative returns plot not found."
-        p.alignment = PP_ALIGN.CENTER
-        p.font.size = Pt(18)
+        tf = slide.placeholders[1] if len(slide.placeholders) > 1 else slide.shapes.add_textbox(Inches(1),Inches(1),Inches(8),Inches(1)).text_frame
+        tf.clear(); p = tf.add_paragraph(); p.text = "Cumulative returns plot not found."; p.alignment = PP_ALIGN.CENTER
     
-    # Slide 5: Summary
+    # Slide 5: Summary & Future Directions
     slide = prs.slides[4]
+    title_shape = slide.shapes.title
+    if title_shape: title_shape.text = "Key Insights & Future Directions"
     if len(slide.placeholders) > 1:
-        tf = slide.placeholders[1].text_frame
-        tf.clear()
-        p = tf.add_paragraph()
-        p.text = summary_text.replace("\\n", "\n")
-        p.font.size = Pt(16) 
+        tf = slide.placeholders[1].text_frame; tf.clear()
+        p = tf.add_paragraph(); p.text = summary_text.replace("\\n", "\n"); p.font.size = Pt(16)
     
-    output_ppt_path = os.path.join(OUTPUT_DIR, f'Module3_Report_{best_model_name}.pptx')
+    output_filename = f'Module3_Report_{best_model_name}.pptx' # Original name for now
+    # If a generic name is required: output_filename = 'Module3_Report.pptx'
+    output_ppt_path = os.path.join(OUTPUT_DIR, output_filename)
     prs.save(output_ppt_path)
     print(f"Presentation updated and saved to: {output_ppt_path}")
 
